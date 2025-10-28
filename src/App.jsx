@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+// Supabase SDK is the only required package for the database
 import { createClient } from '@supabase/supabase-js';
 
-// --- VERCEL ENVIRONMENT VARIABLES (Reading Supabase Config) ---
+// --- VERCEL ENVIRONMENT VARIABLES (Supabase Config) ---
 const VERCEL_APP_ID = import.meta.env.VITE_APP_ID || 'default-app-id';
 const VERCEL_OWNER_ID = import.meta.env.VITE_APP_OWNER_ID || null;
 
-// Supabase configuration must read from Vercel's environment variables
+// Supabase configuration MUST read from Vercel's environment variables
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
@@ -28,7 +29,7 @@ const debounce = (func, delay) => {
 };
 
 /**
- * Custom hook for managing Supabase user sessions.
+ * Custom hook for managing Supabase user sessions (simulated login).
  */
 const useSupabaseAuth = () => {
     const [userId, setUserId] = useState(null);
@@ -37,13 +38,14 @@ const useSupabaseAuth = () => {
 
     useEffect(() => {
         if (!supabase) {
-            console.error("Supabase client is not initialized. Check Vercel environment variables.");
+            // This error occurs if VERCEL_SUPABASE_URL/ANON_KEY are missing on Vercel
+            console.error("SUPABASE CONFIG ERROR: Environment variables are missing.");
             setIsAuthReady(true);
             return;
         }
 
-        // Supabase doesn't need anonymous sign-in like Firebase. 
-        // We simulate a stable user ID using Local Storage for persistence across sessions.
+        // Simulate a stable user ID using Local Storage for persistence across sessions.
+        // This acts as the 'login' in our cardless setup.
         const storedUserId = localStorage.getItem('portfolio_user_id');
         const generatedId = storedUserId || crypto.randomUUID();
         localStorage.setItem('portfolio_user_id', generatedId);
@@ -51,12 +53,12 @@ const useSupabaseAuth = () => {
         setUserId(generatedId);
         setIsAuthReady(true);
 
-        // --- OWNER CHECK ---
+        // --- OWNER CHECK (Security Gate) ---
         if (VERCEL_OWNER_ID && generatedId === VERCEL_OWNER_ID) {
             setIsAppOwner(true);
         }
 
-        // Log the ID for security setup (This is the final purpose of this logger)
+        // Final logging step (Should be removed once VERCEL_OWNER_ID is confirmed)
         if (!VERCEL_OWNER_ID) {
              console.log("SIMULATED USER ID (COPY ME):", generatedId);
         }
@@ -70,49 +72,50 @@ const useSupabaseAuth = () => {
 // --- SUPABASE DATA HOOK ---
 
 /**
- * Custom hook to manage project data fetching and actions (Create/Update/Delete) via Supabase.
+ * Custom hook to manage project data fetching and actions (CRUD) via Supabase.
  */
 const useProjects = ({ userId, isAuthReady }) => {
     const [projects, setProjects] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     
-    // Supabase table name
     const TABLE_NAME = 'projects';
 
-    // 1. Fetching Projects (Real-time Subscription)
+    // Function to fetch data from the projects table where owner_id matches our userId
+    const fetchProjects = useCallback(async () => {
+        if (!supabase || !userId) return;
+        
+        try {
+            // Filter by owner_id and order by created_at
+            const { data, error } = await supabase
+                .from(TABLE_NAME)
+                .select('*')
+                .eq('owner_id', userId)
+                .order('created_at', { ascending: false }); 
+            
+            if (error) throw error;
+            
+            setProjects(data.map(p => ({
+                id: p.id,
+                ...p,
+                createdAt: new Date(p.created_at) // Convert string to Date object
+            })));
+            setError(null);
+        } catch (err) {
+            console.error("Error fetching projects from Supabase:", err);
+            // This error typically means the 'projects' table or RLS is missing.
+            setError("Failed to load projects. Ensure the 'projects' table is correctly set up in Supabase.");
+        } finally {
+            setLoading(false);
+        }
+    }, [userId]);
+
+    // 1. Real-time Subscription and Initial Fetch
     useEffect(() => {
         if (!isAuthReady || !supabase || !userId) {
             setLoading(true);
             return;
         }
-
-        // Function to fetch data from the projects table where owner_id matches our userId
-        const fetchProjects = async () => {
-            try {
-                // Filter by owner_id and order by created_at
-                const { data, error } = await supabase
-                    .from(TABLE_NAME)
-                    .select('*')
-                    .eq('owner_id', userId)
-                    .order('created_at', { ascending: false }); 
-                
-                if (error) throw error;
-                
-                setProjects(data.map(p => ({
-                    id: p.id,
-                    ...p,
-                    createdAt: new Date(p.created_at) // Convert string to Date object
-                })));
-                setError(null);
-            } catch (err) {
-                // Initial failure will occur if the 'projects' table doesn't exist yet.
-                console.error("Error fetching projects from Supabase (Check Table/RLS setup):", err);
-                setError("Failed to load projects. Ensure the 'projects' table is created in Supabase.");
-            } finally {
-                setLoading(false);
-            }
-        };
 
         // Supabase Real-time listener (fires on initial fetch and subsequent changes)
         const channel = supabase
@@ -122,16 +125,15 @@ const useProjects = ({ userId, isAuthReady }) => {
             })
             .subscribe((status) => {
                 if (status === 'SUBSCRIBED') {
-                    fetchProjects(); // Initial fetch
+                    fetchProjects(); // Initial fetch on subscription success
                 }
             });
         
-
         // Cleanup function for the channel subscription
         return () => {
             supabase.removeChannel(channel);
         };
-    }, [userId, isAuthReady]); 
+    }, [userId, isAuthReady, fetchProjects]); 
 
     // 2. Adding a Project
     const addProject = useCallback(async (newProject) => {
@@ -146,14 +148,13 @@ const useProjects = ({ userId, isAuthReady }) => {
                 .insert({
                     ...newProject,
                     owner_id: userId, // CRITICAL: Link project to the owner
-                    // Supabase automatically sets created_at if default is set
                 });
             
             if (error) throw error;
             setError(null);
         } catch (err) {
             console.error("Error adding project to Supabase:", err);
-            setError("Failed to add project. Ensure table and RLS policies are correct.");
+            setError("Failed to add project. Check RLS policies (INSERT).");
         }
     }, [userId]);
 
@@ -165,9 +166,8 @@ const useProjects = ({ userId, isAuthReady }) => {
         }
         
         try {
-            // UpdatedFields should not include the ID
             const fieldsToUpdate = { ...updatedFields };
-            delete fieldsToUpdate.id; 
+            delete fieldsToUpdate.id; // Supabase uses `eq('id', id)` instead of including ID in update payload
 
             const { error } = await supabase
                 .from(TABLE_NAME)
@@ -178,7 +178,7 @@ const useProjects = ({ userId, isAuthReady }) => {
             setError(null);
         } catch (err) {
             console.error("Error updating project in Supabase:", err);
-            setError("Failed to save changes. Check RLS policies.");
+            setError("Failed to save changes. Check RLS policies (UPDATE).");
         }
     }, [userId]);
 
@@ -199,7 +199,7 @@ const useProjects = ({ userId, isAuthReady }) => {
             setError(null);
         } catch (err) {
             console.error("Error deleting project from Supabase:", err);
-            setError("Failed to delete project. Check RLS policies.");
+            setError("Failed to delete project. Check RLS policies (DELETE).");
         }
     }, [userId]);
 
@@ -671,6 +671,7 @@ const App = () => {
     // 3. Auto-Add Initial Project Data (if missing in Supabase)
     // NOTE: We only auto-add if we are the authenticated owner
     useEffect(() => {
+        // We only run this if the owner is authenticated AND the loading is done AND the table is empty
         if (!isAppOwner || loading || projects.length > 0) return;
 
         const initialProjectsData = [
