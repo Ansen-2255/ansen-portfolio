@@ -1,31 +1,18 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { 
-    getFirestore, 
-    collection, 
-    query, 
-    onSnapshot, 
-    addDoc, 
-    deleteDoc, 
-    doc, 
-    serverTimestamp,
-    updateDoc 
-} from 'firebase/firestore';
+import { createClient } from '@supabase/supabase-js';
 
-// --- VERCEL ENVIRONMENT VARIABLES (The Fix for Deployment) ---
+// --- VERCEL ENVIRONMENT VARIABLES (Reading Supabase Config) ---
 const VERCEL_APP_ID = import.meta.env.VITE_APP_ID || 'default-app-id';
 const VERCEL_OWNER_ID = import.meta.env.VITE_APP_OWNER_ID || null;
 
-// The Firebase configuration MUST read from Vercel's environment variables
-const firebaseConfig = {
-    apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-    authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-    projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-    storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-    messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-    appId: import.meta.env.VITE_FIREBASE_APP_ID
-};
+// Supabase configuration must read from Vercel's environment variables
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+// Initialize Supabase Client
+const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY) 
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
 
 // --- Utility Functions ---
 
@@ -41,188 +28,180 @@ const debounce = (func, delay) => {
 };
 
 /**
- * Custom hook for initializing Firebase and handling authentication.
- * @returns {object} { db, auth, userId, isAuthReady, isAppOwner }
+ * Custom hook for managing Supabase user sessions.
  */
-const useFirebaseSetup = () => {
-    // Check if essential config keys are present
-    const isConfigValid = firebaseConfig.apiKey && firebaseConfig.projectId;
-    
-    const [db, setDb] = useState(null);
-    const [auth, setAuth] = useState(null);
+const useSupabaseAuth = () => {
     const [userId, setUserId] = useState(null);
     const [isAuthReady, setIsAuthReady] = useState(false);
     const [isAppOwner, setIsAppOwner] = useState(false);
 
     useEffect(() => {
-        if (!isConfigValid) {
-            console.error("FIREBASE CONFIGURATION ERROR: Vercel environment variables are missing or incorrect. Projects will not load.");
-            setIsAuthReady(true); // Stop loading loop even if failed
+        if (!supabase) {
+            console.error("Supabase client is not initialized. Check Vercel environment variables.");
+            setIsAuthReady(true);
             return;
         }
 
-        try {
-            const app = initializeApp(firebaseConfig);
-            const firestore = getFirestore(app);
-            const authentication = getAuth(app);
-            
-            setDb(firestore);
-            setAuth(authentication);
+        // Supabase doesn't need anonymous sign-in like Firebase. 
+        // We simulate a stable user ID using Local Storage for persistence across sessions.
+        const storedUserId = localStorage.getItem('portfolio_user_id');
+        const generatedId = storedUserId || crypto.randomUUID();
+        localStorage.setItem('portfolio_user_id', generatedId);
 
-            const unsubscribe = onAuthStateChanged(authentication, async (user) => {
-                let currentUserId;
-                
-                if (user) {
-                    currentUserId = user.uid;
-                } else {
-                    // Force anonymous sign-in if no user exists (typical for first load on Vercel)
-                    const anonUser = await signInAnonymously(authentication);
-                    currentUserId = anonUser.user.uid;
-                }
+        setUserId(generatedId);
+        setIsAuthReady(true);
 
-                setUserId(currentUserId);
-                setIsAuthReady(true);
-                
-                // --- OWNER CHECK AND ID LOGGING ---
-                if (VERCEL_OWNER_ID && currentUserId === VERCEL_OWNER_ID) {
-                    setIsAppOwner(true);
-                }
-                
-                // TEMPORARY LOGGING: Used to get the USER ID for the VITE_APP_OWNER_ID variable
-                console.log("AUTHENTICATED USER ID (COPY ME):", currentUserId);
-            });
-
-            return () => unsubscribe();
-        } catch (error) {
-            console.error("Firebase initialization failed:", error);
-            setIsAuthReady(true);
+        // --- OWNER CHECK ---
+        if (VERCEL_OWNER_ID && generatedId === VERCEL_OWNER_ID) {
+            setIsAppOwner(true);
         }
-    }, [isConfigValid]);
 
-    return { db, auth, userId, isAuthReady, isAppOwner };
+        // Log the ID for security setup (This is the final purpose of this logger)
+        if (!VERCEL_OWNER_ID) {
+             console.log("SIMULATED USER ID (COPY ME):", generatedId);
+        }
+        
+    }, []);
+
+    return { userId, isAuthReady, isAppOwner };
 };
 
 
-// --- FIREBASE DATA HOOK ---
+// --- SUPABASE DATA HOOK ---
 
 /**
- * Custom hook to manage project data fetching and actions (Create/Update/Delete).
- * @param {object} { db, userId, isAuthReady }
- * @returns {object} { projects, addProject, updateProject, deleteProject, error, loading }
+ * Custom hook to manage project data fetching and actions (Create/Update/Delete) via Supabase.
  */
-const useProjects = ({ db, userId, isAuthReady }) => {
+const useProjects = ({ userId, isAuthReady }) => {
     const [projects, setProjects] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    
+    // Supabase table name
+    const TABLE_NAME = 'projects';
 
-    // Define the project collection path (Private data)
-    const getCollectionPath = useCallback(() => {
-        if (!userId) return null;
-        // Use the VERCEL_APP_ID for deployment consistency
-        return `/artifacts/${VERCEL_APP_ID}/users/${userId}/projects`; 
-    }, [userId]);
-
-    // 1. Fetching Projects (onSnapshot Listener)
+    // 1. Fetching Projects (Real-time Subscription)
     useEffect(() => {
-        if (!isAuthReady || !db || !userId) {
+        if (!isAuthReady || !supabase || !userId) {
             setLoading(true);
             return;
         }
 
-        const path = getCollectionPath();
-        if (!path) return;
-        
-        const projectsRef = collection(db, path);
-        const q = query(projectsRef);
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
+        // Function to fetch data from the projects table where owner_id matches our userId
+        const fetchProjects = async () => {
             try {
-                const fetchedProjects = snapshot.docs.map(doc => ({
-                    id: doc.id,
-                    ...doc.data(),
-                    // Ensure timestamp is converted to a sortable format
-                    createdAt: doc.data().createdAt?.toDate() || new Date(0)
-                })).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()); // Sort newest first
-
-                setProjects(fetchedProjects);
+                // Filter by owner_id and order by created_at
+                const { data, error } = await supabase
+                    .from(TABLE_NAME)
+                    .select('*')
+                    .eq('owner_id', userId)
+                    .order('created_at', { ascending: false }); 
+                
+                if (error) throw error;
+                
+                setProjects(data.map(p => ({
+                    id: p.id,
+                    ...p,
+                    createdAt: new Date(p.created_at) // Convert string to Date object
+                })));
                 setError(null);
             } catch (err) {
-                console.error("Error fetching projects:", err);
-                setError("Failed to load projects.");
+                // Initial failure will occur if the 'projects' table doesn't exist yet.
+                console.error("Error fetching projects from Supabase (Check Table/RLS setup):", err);
+                setError("Failed to load projects. Ensure the 'projects' table is created in Supabase.");
             } finally {
                 setLoading(false);
             }
-        }, (err) => {
-            console.error("Firestore error onSnapshot:", err);
-            setError("Real-time project updates failed.");
-            setLoading(false);
-        });
+        };
 
-        return () => unsubscribe();
-    }, [db, userId, isAuthReady, getCollectionPath]);
+        // Supabase Real-time listener (fires on initial fetch and subsequent changes)
+        const channel = supabase
+            .channel('public_projects_changes')
+            .on('postgres_changes', { event: '*', schema: 'public', table: TABLE_NAME }, () => {
+                fetchProjects(); // Re-fetch data on any change
+            })
+            .subscribe((status) => {
+                if (status === 'SUBSCRIBED') {
+                    fetchProjects(); // Initial fetch
+                }
+            });
+        
+
+        // Cleanup function for the channel subscription
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }, [userId, isAuthReady]); 
 
     // 2. Adding a Project
     const addProject = useCallback(async (newProject) => {
-        if (!db || !userId) {
-            setError("Authentication required to add project.");
+        if (!supabase || !userId) {
+            setError("Error: Supabase not ready or User ID missing.");
             return;
         }
         
-        const path = getCollectionPath();
-        if (!path) return;
-
         try {
-            await addDoc(collection(db, path), {
-                ...newProject,
-                createdAt: serverTimestamp(),
-            });
+            const { error } = await supabase
+                .from(TABLE_NAME)
+                .insert({
+                    ...newProject,
+                    owner_id: userId, // CRITICAL: Link project to the owner
+                    // Supabase automatically sets created_at if default is set
+                });
+            
+            if (error) throw error;
             setError(null);
         } catch (err) {
-            console.error("Error adding project:", err);
-            setError("Failed to add project. Please try again.");
+            console.error("Error adding project to Supabase:", err);
+            setError("Failed to add project. Ensure table and RLS policies are correct.");
         }
-    }, [db, userId, getCollectionPath]);
+    }, [userId]);
 
     // 3. Updating a Project
     const updateProject = useCallback(async (id, updatedFields) => {
-        if (!db || !userId) {
-            setError("Authentication required to update project.");
+        if (!supabase || !userId) {
+            setError("Error: Supabase not ready or User ID missing.");
             return;
         }
-
-        const path = getCollectionPath();
-        if (!path) return;
         
         try {
-            const projectDocRef = doc(db, path, id);
-            // Use updateDoc for partial updates
-            await updateDoc(projectDocRef, updatedFields); 
+            // UpdatedFields should not include the ID
+            const fieldsToUpdate = { ...updatedFields };
+            delete fieldsToUpdate.id; 
+
+            const { error } = await supabase
+                .from(TABLE_NAME)
+                .update(fieldsToUpdate)
+                .eq('id', id);
+            
+            if (error) throw error;
             setError(null);
         } catch (err) {
-            console.error("Error updating project:", err);
-            setError("Failed to save changes.");
+            console.error("Error updating project in Supabase:", err);
+            setError("Failed to save changes. Check RLS policies.");
         }
-    }, [db, userId, getCollectionPath]);
+    }, [userId]);
 
     // 4. Deleting a Project
     const deleteProject = useCallback(async (id) => {
-        if (!db || !userId) {
-            setError("Authentication required to delete project.");
+        if (!supabase || !userId) {
+            setError("Error: Supabase not ready or User ID missing.");
             return;
         }
-
-        const path = getCollectionPath();
-        if (!path) return;
         
         try {
-            const projectDocRef = doc(db, path, id);
-            await deleteDoc(projectDocRef);
+            const { error } = await supabase
+                .from(TABLE_NAME)
+                .delete()
+                .eq('id', id);
+            
+            if (error) throw error;
             setError(null);
         } catch (err) {
-            console.error("Error deleting project:", err);
-            setError("Failed to delete project. Please try again.");
+            console.error("Error deleting project from Supabase:", err);
+            setError("Failed to delete project. Check RLS policies.");
         }
-    }, [db, userId, getCollectionPath]);
+    }, [userId]);
 
     return { projects, addProject: debounce(addProject, 300), updateProject, deleteProject, error, loading };
 };
@@ -447,7 +426,7 @@ const ProfileManagementPanel = ({ profile, setProfile, inputStyle }) => {
 };
 
 
-const ProjectForm = ({ addProject, updateProject, currentProject, setCurrentProject, error: firebaseError, inputStyle, isAppOwner }) => {
+const ProjectForm = ({ addProject, updateProject, currentProject, setCurrentProject, error: dbError, inputStyle, isAppOwner }) => {
     
     // Initialize form state from currentProject or use empty strings for new project
     const isEditing = !!currentProject;
@@ -581,8 +560,8 @@ const ProjectForm = ({ addProject, updateProject, currentProject, setCurrentProj
                 >
                     {isEditing ? 'Save Changes' : 'Add Project'}
                 </button>
-                {(submissionError || firebaseError) && (
-                    <p className="text-red-400 text-sm mt-2">{submissionError || firebaseError}</p>
+                {(submissionError || dbError) && (
+                    <p className="text-red-400 text-sm mt-2">{submissionError || dbError}</p>
                 )}
             </form>
         </div>
@@ -632,8 +611,8 @@ const App = () => {
     const [currentProject, setCurrentProject] = useState(null); // New state to track project being edited
     
     // Auth and Data setup from the custom hook
-    const { db, userId, isAuthReady, isAppOwner } = useFirebaseSetup();
-    const { projects, addProject, updateProject, deleteProject, error, loading } = useProjects({ db, userId, isAuthReady });
+    const { userId, isAuthReady, isAppOwner } = useSupabaseAuth();
+    const { projects, addProject, updateProject, deleteProject, error, loading } = useProjects({ userId, isAuthReady });
 
     // Initial Profile data (now in useState to allow runtime changes)
     const initialProfile = useMemo(() => ({
@@ -657,7 +636,6 @@ const App = () => {
             setCurrentProject(null); // Clear editing state when leaving Manager Mode
         } else {
             console.warn("Access Denied: Only the owner (as defined by VITE_APP_OWNER_ID) can access Manager Mode.");
-            // Optionally alert the user here, but we are avoiding alert()
         }
     };
     
@@ -690,10 +668,10 @@ const App = () => {
         );
     }, [projects, activeTag]);
 
-    // 3. Auto-Add Initial Project Data (if missing in Firestore)
+    // 3. Auto-Add Initial Project Data (if missing in Supabase)
     // NOTE: We only auto-add if we are the authenticated owner
     useEffect(() => {
-        if (!isAppOwner || loading) return;
+        if (!isAppOwner || loading || projects.length > 0) return;
 
         const initialProjectsData = [
             {
@@ -719,18 +697,16 @@ const App = () => {
             },
         ];
 
-        const titles = projects.map(p => p.title);
-        const projectsToAdd = initialProjectsData.filter(ip => !titles.includes(ip.title));
-
-        if (projectsToAdd.length > 0) {
+        // This check ensures we only run if the projects list is empty (first time only)
+        if (projects.length === 0) {
             const timer = setTimeout(() => {
-                 projectsToAdd.forEach(p => addProject(p));
+                 initialProjectsData.forEach(p => addProject(p));
             }, 1500);
 
             return () => clearTimeout(timer);
         }
         
-    }, [isAppOwner, loading, projects, addProject]);
+    }, [isAppOwner, loading, projects.length, addProject]);
 
     // SEO Head management
     useEffect(() => {
@@ -812,7 +788,7 @@ const App = () => {
                     {isAuthReady && (
                         <button
                             onClick={handleToggleManager}
-                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-300 ${isManagerMode ? 'bg-red-500 hover:bg-red-600' : 'bg-gray-700 hover:bg-gray-600'}`}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-300 ${isManagerMode && canManage ? 'bg-red-500 hover:bg-red-600' : 'bg-gray-700 hover:bg-gray-600'}`}
                         >
                             {isManagerMode ? 'Exit Manager Mode (Public View)' : 'Manager Mode'}
                         </button>
@@ -873,7 +849,7 @@ const App = () => {
                             <p><span className="text-cyan-400">Stack:</span> MERN (MongoDB, Express, React, Node.js)</p>
                             <p><span className="text-cyan-400">Frontend:</span> React, Tailwind CSS</p>
                             <p><span className="text-cyan-400">Backend:</span> Node.js, Express.js</p>
-                            <p><span className="text-cyan-400">Database:</span> Firestore (for this demo's persistent storage)</p>
+                            <p><span className="text-cyan-400">Database:</span> Supabase (for this demo's persistent storage)</p>
                         </div>
                     </div>
                 </section>
@@ -883,7 +859,7 @@ const App = () => {
                     <h2 className="text-4xl font-bold text-white mb-12 text-center">My Projects</h2>
 
                     {/* Manager Panels (Conditionally rendered) */}
-                    {isManagerMode && (
+                    {isManagerMode && canManage && (
                         <>
                             <ProfileManagementPanel 
                                 profile={profile} 
@@ -901,6 +877,12 @@ const App = () => {
                             />
                         </>
                     )}
+                    {isManagerMode && !canManage && (
+                        <div className="text-center p-8 text-red-400 border border-red-500/30 bg-red-900/10 rounded-lg mb-12">
+                            Access Denied: Only the owner (ID: {VERCEL_OWNER_ID}) can manage projects.
+                        </div>
+                    )}
+
 
                     {/* Project List */}
                     {initialLoading && (
@@ -923,7 +905,7 @@ const App = () => {
                     
                     {!initialLoading && !error && filteredProjects.length === 0 && (
                         <div className="text-center p-8 text-gray-500">
-                            No projects match the selected filter. Try clearing the filter!
+                            {activeTag ? 'No projects match the selected filter.' : 'No projects found in the database. Add one now!'}
                         </div>
                     )}
 
@@ -943,7 +925,7 @@ const App = () => {
                 
                 {/* Contact Section */}
                 <section id="contact" className="py-20 border-t border-gray-800">
-                    <h2 className="4xl font-bold text-white mb-8 text-center">Get In Touch</h2>
+                    <h2 className="text-4xl font-bold text-white mb-8 text-center">Get In Touch</h2>
                     <div className="max-w-2xl mx-auto bg-gray-900 p-8 rounded-xl shadow-2xl border border-gray-800 text-center">
                         <p className="text-gray-400 mb-6">
                             I'm currently available for new opportunities. Feel free to reach out!
@@ -974,7 +956,7 @@ const App = () => {
 
             {/* Footer */}
             <footer className="bg-gray-900 mt-12 py-8 border-t border-gray-800 text-center text-gray-500">
-                <p>&copy; {new Date().getFullYear()} {profile.name}. Built with React & MERN principles (using Firestore for persistence).</p>
+                <p>&copy; {new Date().getFullYear()} {profile.name}. Built with React & MERN principles (using Supabase for persistence).</p>
             </footer>
         </div>
     );
