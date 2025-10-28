@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { 
     getFirestore, 
     collection, 
@@ -13,39 +13,54 @@ import {
     updateDoc 
 } from 'firebase/firestore';
 
-// --- Global Context Variables (Mandatory for Canvas Environment) ---
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+// --- VERCEL ENVIRONMENT VARIABLES (The Fix for Deployment) ---
+const VERCEL_APP_ID = import.meta.env.VITE_APP_ID || 'default-app-id';
+const VERCEL_OWNER_ID = import.meta.env.VITE_APP_OWNER_ID || null;
+
+// The Firebase configuration MUST read from Vercel's environment variables
+const firebaseConfig = {
+    apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+    authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+    projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+    storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+    messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+    appId: import.meta.env.VITE_FIREBASE_APP_ID
+};
 
 // --- Utility Functions ---
 
 // Debounce function to limit function calls
 const debounce = (func, delay) => {
-  let timeoutId;
-  return (...args) => {
-    clearTimeout(timeoutId);
-    timeoutId = setTimeout(() => {
-      func.apply(this, args);
-    }, delay);
-  };
+    let timeoutId;
+    return (...args) => {
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => {
+            func.apply(this, args);
+        }, delay);
+    };
 };
 
 /**
  * Custom hook for initializing Firebase and handling authentication.
- * @returns {object} { db, auth, userId, isAuthReady }
+ * @returns {object} { db, auth, userId, isAuthReady, isAppOwner }
  */
 const useFirebaseSetup = () => {
-    if (!firebaseConfig) {
-        console.error("Firebase config is missing.");
-        return { db: null, auth: null, userId: null, isAuthReady: false };
-    }
+    // Check if essential config keys are present
+    const isConfigValid = firebaseConfig.apiKey && firebaseConfig.projectId;
+    
     const [db, setDb] = useState(null);
     const [auth, setAuth] = useState(null);
     const [userId, setUserId] = useState(null);
     const [isAuthReady, setIsAuthReady] = useState(false);
+    const [isAppOwner, setIsAppOwner] = useState(false);
 
     useEffect(() => {
+        if (!isConfigValid) {
+            console.error("FIREBASE CONFIGURATION ERROR: Vercel environment variables are missing or incorrect. Projects will not load.");
+            setIsAuthReady(true); // Stop loading loop even if failed
+            return;
+        }
+
         try {
             const app = initializeApp(firebaseConfig);
             const firestore = getFirestore(app);
@@ -55,38 +70,36 @@ const useFirebaseSetup = () => {
             setAuth(authentication);
 
             const unsubscribe = onAuthStateChanged(authentication, async (user) => {
+                let currentUserId;
+                
                 if (user) {
-                    setUserId(user.uid);
+                    currentUserId = user.uid;
                 } else {
-                    // Sign in anonymously if no token is available for fresh starts
-                    if (!initialAuthToken) {
-                        const anonUser = await signInAnonymously(authentication);
-                        setUserId(anonUser.user.uid);
-                    }
+                    // Force anonymous sign-in if no user exists (typical for first load on Vercel)
+                    const anonUser = await signInAnonymously(authentication);
+                    currentUserId = anonUser.user.uid;
                 }
-                setIsAuthReady(true);
-            });
 
-            // Try to sign in with the custom token provided by the environment
-            if (initialAuthToken) {
-                signInWithCustomToken(authentication, initialAuthToken)
-                    .catch(e => {
-                        console.error("Error signing in with custom token:", e);
-                        // Fallback to anonymous sign-in if token fails
-                        signInAnonymously(authentication).then(anonUser => setUserId(anonUser.user.uid));
-                    });
-            } else {
-                 // Trigger the onAuthStateChanged listener to handle anonymous sign-in if no token
-            }
+                setUserId(currentUserId);
+                setIsAuthReady(true);
+                
+                // --- OWNER CHECK AND ID LOGGING ---
+                if (VERCEL_OWNER_ID && currentUserId === VERCEL_OWNER_ID) {
+                    setIsAppOwner(true);
+                }
+                
+                // TEMPORARY LOGGING: Used to get the USER ID for the VITE_APP_OWNER_ID variable
+                console.log("AUTHENTICATED USER ID (COPY ME):", currentUserId);
+            });
 
             return () => unsubscribe();
         } catch (error) {
             console.error("Firebase initialization failed:", error);
+            setIsAuthReady(true);
         }
-        return () => {};
-    }, []);
+    }, [isConfigValid]);
 
-    return { db, auth, userId, isAuthReady };
+    return { db, auth, userId, isAuthReady, isAppOwner };
 };
 
 
@@ -105,7 +118,8 @@ const useProjects = ({ db, userId, isAuthReady }) => {
     // Define the project collection path (Private data)
     const getCollectionPath = useCallback(() => {
         if (!userId) return null;
-        return `/artifacts/${appId}/users/${userId}/projects`;
+        // Use the VERCEL_APP_ID for deployment consistency
+        return `/artifacts/${VERCEL_APP_ID}/users/${userId}/projects`; 
     }, [userId]);
 
     // 1. Fetching Projects (onSnapshot Listener)
@@ -186,7 +200,7 @@ const useProjects = ({ db, userId, isAuthReady }) => {
             setError(null);
         } catch (err) {
             console.error("Error updating project:", err);
-            setError("Failed to update project. Please try again.");
+            setError("Failed to save changes.");
         }
     }, [db, userId, getCollectionPath]);
 
@@ -214,7 +228,7 @@ const useProjects = ({ db, userId, isAuthReady }) => {
 };
 
 
-// --- APPLICATION COMPONENTS ---
+// --- APPLICATION COMPONENTS (Visuals and Interaction) ---
 
 const LinkButton = ({ href, icon, label }) => {
     if (!href || href === '#') return null;
@@ -433,7 +447,7 @@ const ProfileManagementPanel = ({ profile, setProfile, inputStyle }) => {
 };
 
 
-const ProjectForm = ({ addProject, updateProject, currentProject, setCurrentProject, error: firebaseError, inputStyle }) => {
+const ProjectForm = ({ addProject, updateProject, currentProject, setCurrentProject, error: firebaseError, inputStyle, isAppOwner }) => {
     
     // Initialize form state from currentProject or use empty strings for new project
     const isEditing = !!currentProject;
@@ -472,6 +486,11 @@ const ProjectForm = ({ addProject, updateProject, currentProject, setCurrentProj
 
         if (!title || !description || !technologies) {
             setSubmissionError("Title, Description, and Technologies are required.");
+            return;
+        }
+
+        if (!isAppOwner) {
+            setSubmissionError("SECURITY ERROR: You must be authenticated as the app owner to add/edit projects.");
             return;
         }
 
@@ -593,7 +612,7 @@ const TagFilter = ({ allTags, activeTag, setActiveTag }) => {
                         {tag}
                     </button>
                 ))}
-                 {activeTag && (
+                   {activeTag && (
                     <button
                         onClick={() => setActiveTag(null)}
                         className="px-4 py-2 rounded-full text-sm font-medium bg-red-600 text-white hover:bg-red-700 transition-all"
@@ -612,7 +631,8 @@ const App = () => {
     const [activeTag, setActiveTag] = useState(null); 
     const [currentProject, setCurrentProject] = useState(null); // New state to track project being edited
     
-    const { db, userId, isAuthReady } = useFirebaseSetup();
+    // Auth and Data setup from the custom hook
+    const { db, userId, isAuthReady, isAppOwner } = useFirebaseSetup();
     const { projects, addProject, updateProject, deleteProject, error, loading } = useProjects({ db, userId, isAuthReady });
 
     // Initial Profile data (now in useState to allow runtime changes)
@@ -628,9 +648,17 @@ const App = () => {
 
     const [profile, setProfile] = useState(initialProfile);
 
+    // Manager Mode is now conditional on being the Owner
+    const canManage = isAuthReady && isAppOwner;
+
     const handleToggleManager = () => {
-        setIsManagerMode(prev => !prev);
-        setCurrentProject(null); // Clear editing state when leaving Manager Mode
+        if (canManage) {
+            setIsManagerMode(prev => !prev);
+            setCurrentProject(null); // Clear editing state when leaving Manager Mode
+        } else {
+            console.warn("Access Denied: Only the owner (as defined by VITE_APP_OWNER_ID) can access Manager Mode.");
+            // Optionally alert the user here, but we are avoiding alert()
+        }
     };
     
     const initialLoading = !isAuthReady || loading;
@@ -663,8 +691,9 @@ const App = () => {
     }, [projects, activeTag]);
 
     // 3. Auto-Add Initial Project Data (if missing in Firestore)
+    // NOTE: We only auto-add if we are the authenticated owner
     useEffect(() => {
-        if (!isAuthReady || loading) return;
+        if (!isAppOwner || loading) return;
 
         const initialProjectsData = [
             {
@@ -683,7 +712,7 @@ const App = () => {
             },
             {
                 title: "Hangman App",
-                description: "Developed a classic Hangman word-guessing game tailored for the Android platform. This mobile application utilizes Java and Android Studio to manage game state, user input, and dynamic UI rendering based on player attempts. The project showcases understanding of mobile application architecture, state management within an activity lifecycle, and fundamental game logic implementation.",
+                description: "Developed a classic Hangman word-guessing game tailored for the Android platform. This mobile application utilizes Java and Android Studio to manage game state, user input, and dynamic UI rendering based on player attempts. The project showcases practical mobile development skills, user interface design, and state management within an activity lifecycle, and fundamental game logic implementation.",
                 technologies: "Android Studio, Java, Mobile Development",
                 githubUrl: "https://github.com/Ansen-2255/hangman-mobile-application", 
                 liveDemoUrl: "#", 
@@ -701,7 +730,7 @@ const App = () => {
             return () => clearTimeout(timer);
         }
         
-    }, [isAuthReady, loading, projects, addProject]);
+    }, [isAppOwner, loading, projects, addProject]);
 
     // SEO Head management
     useEffect(() => {
@@ -752,9 +781,13 @@ const App = () => {
                     white-space: pre-wrap; /* Ensures line breaks in description are respected */
                 }
                 /* Transition for scale effect */
-                .hover\:scale-\[1\.03\]:hover {
+                .hover\\:scale-\\[1\\.03\\]:hover {
                     transform: scale(1.03);
                 }
+                /* Crucial fix for Tailwind visibility on Vercel */
+                @tailwind base;
+                @tailwind components;
+                @tailwind utilities;
             `}</style>
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
@@ -776,12 +809,14 @@ const App = () => {
                         ))}
                     </nav>
                     {/* Toggle button for Manager Mode / Public View */}
-                    <button
-                        onClick={handleToggleManager}
-                        className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-300 ${isManagerMode ? 'bg-red-500 hover:bg-red-600' : 'bg-gray-700 hover:bg-gray-600'}`}
-                    >
-                        {isManagerMode ? 'Exit Manager Mode (Public View)' : 'Manager Mode'}
-                    </button>
+                    {isAuthReady && (
+                        <button
+                            onClick={handleToggleManager}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-300 ${isManagerMode ? 'bg-red-500 hover:bg-red-600' : 'bg-gray-700 hover:bg-gray-600'}`}
+                        >
+                            {isManagerMode ? 'Exit Manager Mode (Public View)' : 'Manager Mode'}
+                        </button>
+                    )}
                 </div>
             </header>
 
@@ -814,11 +849,11 @@ const App = () => {
                         {profile.name}
                     </h2>
                     <p className="text-xl text-gray-400 mb-8">{profile.tagline}</p>
-                    {/* Hide User ID in Public View */}
+                    {/* Display Owner ID only in Manager Mode for debugging */}
                     {isAuthReady && userId && isManagerMode && (
                         <div className="text-sm text-gray-500 mb-4">
-                             <span className="font-bold text-cyan-500">USER ID: </span>
-                             <span className="break-all">{userId}</span>
+                            <span className="font-bold text-cyan-500">USER ID: </span>
+                            <span className="break-all">{userId}</span>
                         </div>
                     )}
                     <a 
@@ -862,6 +897,7 @@ const App = () => {
                                 setCurrentProject={setCurrentProject}
                                 error={error}
                                 inputStyle={inputStyle}
+                                isAppOwner={isAppOwner}
                             />
                         </>
                     )}
