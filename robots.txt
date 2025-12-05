@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://ansen-portfolio.netlify.app/sitemap.xml
+Sitemap: https://ansen-portfolio.onrender.com/sitemap.xml
